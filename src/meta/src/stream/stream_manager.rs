@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::Context;
 use await_tree::span;
 use futures::future::join_all;
 use itertools::Itertools;
@@ -32,6 +33,7 @@ use risingwave_pb::plan_common::{PbColumnCatalog, PbField};
 use risingwave_pb::serverless_backfill_controller::{
     ProvisionRequest, node_group_controller_service_client,
 };
+use risingwave_rpc_client::error::TonicStatusWrapper;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use thiserror_ext::AsReport;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, oneshot};
@@ -520,21 +522,18 @@ impl GlobalStreamManager {
                 sbc_addr.clone(),
             )
             .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "unable to reach serverless backfill controller at addr {}: {}",
-                    sbc_addr,
-                    e.as_report()
+            .with_context(|| {
+                format!(
+                    "unable to reach serverless backfill controller at addr {}",
+                    sbc_addr
                 )
             })?;
 
         match client.provision(request).await {
             Ok(resp) => Ok(resp.into_inner().resource_group),
-            Err(e) => Err(anyhow::anyhow!(
-                "serverless backfill controller returned error: {}",
-                e.as_report()
-            )
-            .into()),
+            Err(e) => Err(anyhow::Error::new(TonicStatusWrapper::new(e))
+                .context("serverless backfill controller returned error")
+                .into()),
         }
     }
 
