@@ -259,8 +259,10 @@ impl ToStream for LogicalProject {
             .to_stream_with_dist_required(&input_required, ctx)?;
 
         let should_materialize_expr = match new_input.stream_kind() {
-            StreamKind::AppendOnly => None,
-            kind @ (StreamKind::Retract | StreamKind::Upsert) => {
+            StreamKind::AppendOnly | StreamKind::RowIdNotFilled { append_only: true } => None,
+            kind @ (StreamKind::Retract
+            | StreamKind::Upsert
+            | StreamKind::RowIdNotFilled { append_only: false }) => {
                 // Extract impure functions to `MaterializedExprs` operator
                 let mut impure_field_names = BTreeMap::new();
                 let mut impure_expr_indices = HashSet::new();
@@ -283,12 +285,14 @@ impl ToStream for LogicalProject {
                     .collect();
                 if impure_exprs.is_empty() {
                     None
-                } else if kind == StreamKind::Upsert
-                    && new_input
-                        .stream_key()
-                        .into_iter()
-                        .flatten()
-                        .all(|stream_key_idx| !impure_expr_indices.contains(stream_key_idx))
+                } else if matches!(
+                    kind,
+                    StreamKind::Upsert | StreamKind::RowIdNotFilled { append_only: false }
+                ) && new_input
+                    .stream_key()
+                    .into_iter()
+                    .flatten()
+                    .all(|stream_key_idx| !impure_expr_indices.contains(stream_key_idx))
                 {
                     // We're operating on non-stream-key columns of upsert stream, no need to materialize.
                     None

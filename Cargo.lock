@@ -12368,7 +12368,6 @@ dependencies = [
  "sha2 0.10.9",
  "smallvec",
  "speedate",
- "static_assertions",
  "tempfile",
  "thiserror 2.0.17",
  "thiserror-ext",
