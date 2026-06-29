@@ -32,8 +32,9 @@ use tokio::task::JoinHandle;
 
 use crate::controller::fragment::FragmentParallelismInfo;
 use crate::controller::session_params::SessionParamsControllerRef;
-use crate::manager::{LocalNotification, MetadataManager, NotificationManagerRef};
+use crate::manager::{LocalNotification, MetadataManager, NotificationManagerRef, WorkerKey};
 use crate::model::FragmentId;
+use crate::table_refill::build_hummock_serving_table_vnode_runtime_config;
 
 pub type ServingVnodeMappingRef = Arc<ServingVnodeMapping>;
 
@@ -173,6 +174,33 @@ async fn fetch_serving_infos(
     )
 }
 
+pub async fn notify_hummock_serving_table_vnode_mappings(
+    notification_manager: &NotificationManagerRef,
+    serving_vnode_mapping: &ServingVnodeMappingRef,
+    workers: &[WorkerNode],
+    streaming_parallelisms: &HashMap<FragmentId, FragmentParallelismInfo>,
+) {
+    for worker in workers {
+        let Some(host) = worker.host.clone() else {
+            tracing::warn!(worker_id = %worker.id, "serving worker host not found");
+            continue;
+        };
+        let config = build_hummock_serving_table_vnode_runtime_config(
+            serving_vnode_mapping,
+            worker.id,
+            streaming_parallelisms,
+            0,
+        );
+        notification_manager
+            .notify_hummock_targeted(
+                WorkerKey(host),
+                Operation::Update,
+                Info::TableRefillRuntimeConfig(config),
+            )
+            .await;
+    }
+}
+
 pub fn start_serving_vnode_mapping_worker(
     notification_manager: NotificationManagerRef,
     metadata_manager: MetadataManager,
@@ -211,6 +239,13 @@ pub fn start_serving_vnode_mapping_worker(
                     mappings: to_fragment_worker_slot_mapping(&mappings),
                 }),
             );
+            notify_hummock_serving_table_vnode_mappings(
+                &notification_manager,
+                &serving_vnode_mapping,
+                &workers,
+                &streaming_parallelisms,
+            )
+            .await;
         };
         loop {
             tokio::select! {
@@ -255,6 +290,13 @@ pub fn start_serving_vnode_mapping_worker(
                                         tracing::warn!("Fail to update serving vnode mapping for fragments {:?}.", failed);
                                         notification_manager.notify_frontend_without_version(Operation::Delete, Info::ServingWorkerSlotMappings(FragmentWorkerSlotMappings{ mappings: to_deleted_fragment_worker_slot_mapping(failed.keys().cloned())}));
                                     }
+                                    notify_hummock_serving_table_vnode_mappings(
+                                        &notification_manager,
+                                        &serving_vnode_mapping,
+                                        &workers,
+                                        &streaming_parallelisms,
+                                    )
+                                    .await;
                                 }
                                 LocalNotification::ServingFragmentMappingsDelete(fragment_ids) => {
                                     if fragment_ids.is_empty() {
@@ -265,6 +307,14 @@ pub fn start_serving_vnode_mapping_worker(
 
                                     serving_vnode_mapping.remove(&fragment_ids);
                                     notification_manager.notify_frontend_without_version(Operation::Delete, Info::ServingWorkerSlotMappings(FragmentWorkerSlotMappings{ mappings: to_deleted_fragment_worker_slot_mapping(fragment_ids.iter().cloned()) }));
+                                    let (workers, streaming_parallelisms) = fetch_serving_infos(&metadata_manager).await;
+                                    notify_hummock_serving_table_vnode_mappings(
+                                        &notification_manager,
+                                        &serving_vnode_mapping,
+                                        &workers,
+                                        &streaming_parallelisms,
+                                    )
+                                    .await;
                                 }
                                 _ => {}
                             }
