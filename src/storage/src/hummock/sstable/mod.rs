@@ -301,9 +301,40 @@ impl<'a> SstableMetaHandle<'a> {
         }
     }
 
+    pub fn estimated_size(&self) -> u32 {
+        match self {
+            Self::V2(sst) => sst.meta.estimated_size,
+        }
+    }
+
+    pub fn smallest_key(&self) -> &'a Vec<u8> {
+        match self {
+            Self::V2(sst) => &sst.meta.smallest_key,
+        }
+    }
+
     pub fn block_meta(&self, global_block_idx: usize) -> &'a BlockMeta {
         match self {
             Self::V2(sst) => &sst.meta.block_metas[global_block_idx],
+        }
+    }
+
+    pub fn largest_key(&self) -> &'a Vec<u8> {
+        match self {
+            Self::V2(sst) => &sst.meta.largest_key,
+        }
+    }
+
+    /// Returns the exclusive upper key boundary for a block range ending at
+    /// `block_end_idx`.
+    ///
+    /// When the range reaches the last block, the SST largest key is used as
+    /// the boundary. Otherwise, the smallest key of the next block is used.
+    pub fn block_upper_bound_key(&self, block_end_idx: usize) -> &'a Vec<u8> {
+        if block_end_idx == self.block_count() {
+            self.largest_key()
+        } else {
+            &self.block_meta(block_end_idx).smallest_key
         }
     }
 

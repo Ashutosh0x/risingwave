@@ -246,12 +246,13 @@ pub async fn sst_dump_via_sstable_store(
         .await?;
     let sstable = sstable_cache.as_ref();
     let sstable_meta = &sstable.meta;
-    let smallest_key = FullKey::decode(&sstable_meta.smallest_key);
-    let largest_key = FullKey::decode(&sstable_meta.largest_key);
+    let meta_handle = SstableMetaHandle::v2(sstable);
+    let smallest_key = FullKey::decode(meta_handle.smallest_key());
+    let largest_key = FullKey::decode(meta_handle.largest_key());
 
     println!("SST object id: {}", object_id);
     println!("-------------------------------------");
-    println!("File Size: {}", sstable_meta.estimated_size);
+    println!("File Size: {}", meta_handle.estimated_size());
 
     println!("Key Range:");
     println!(
@@ -259,13 +260,13 @@ pub async fn sst_dump_via_sstable_store(
         smallest_key, largest_key,
     );
 
-    println!("Estimated Table Size: {}", sstable_meta.estimated_size);
+    println!("Estimated Table Size: {}", meta_handle.estimated_size());
     println!("Bloom Filter Size: {}", sstable_meta.bloom_filter.len());
     println!("Key Count: {}", sstable_meta.key_count);
     println!("Version: {}", sstable_meta.version);
 
-    println!("Block Count: {}", sstable.block_count());
-    for i in 0..sstable.block_count() {
+    println!("Block Count: {}", meta_handle.block_count());
+    for i in 0..meta_handle.block_count() {
         if let Some(block_id) = &args.block_id {
             if *block_id == i as u64 {
                 print_block(i, table_data, sstable_store, sstable, args).await?;

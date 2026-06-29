@@ -425,7 +425,7 @@ impl SstableStore {
                     start_offset,
                     end_offset,
                     object_id,
-                    sst.meta.estimated_size,
+                    meta_handle.estimated_size(),
                 );
                 return Err(e.into());
             }
@@ -484,7 +484,7 @@ impl SstableStore {
         let (range, uncompressed_capacity) = meta_handle.block_range(block_index);
         let store = self.store.clone();
 
-        let file_size = sst.meta.estimated_size;
+        let file_size = meta_handle.estimated_size();
         let data_path = Arc::new(self.get_sst_data_path(object_id));
 
         let disable_cache: fn() -> bool = || {

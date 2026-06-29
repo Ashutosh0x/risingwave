@@ -134,7 +134,9 @@ impl BackwardSstableIterator {
         idx: isize,
         seek_key: Option<FullKey<&[u8]>>,
     ) -> HummockResult<()> {
-        if idx >= self.sst.block_count() as isize || idx < self.read_block_meta_range.0 as isize {
+        let meta_handle = SstableMetaHandle::v2(&self.sst);
+        if idx >= meta_handle.block_count() as isize || idx < self.read_block_meta_range.0 as isize
+        {
             self.block_iter = None;
         } else {
             let block = self
@@ -197,8 +199,9 @@ impl HummockIterator for BackwardSstableIterator {
     }
 
     async fn seek<'a>(&'a mut self, key: FullKey<&'a [u8]>) -> HummockResult<()> {
-        let block_idx = SstableMetaHandle::v2(&self.sst)
-            .block_metas_partition_point(0..=self.sst.block_count() - 1, |block_meta| {
+        let meta_handle = SstableMetaHandle::v2(&self.sst);
+        let block_idx = meta_handle
+            .block_metas_partition_point(0..=meta_handle.block_count() - 1, |block_meta| {
                 // Compare by version comparator
                 // Note: we are comparing against the `smallest_key` of the `block`, thus the
                 // partition point should be `prev(<=)` instead of `<`.
