@@ -29,7 +29,7 @@ use risingwave_hummock_sdk::key::FullKey;
 use risingwave_hummock_sdk::key_range::KeyRange;
 use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_hummock_sdk::table_stats::TableStats;
-use risingwave_hummock_sdk::{EpochWithGap, LocalSstableInfo, can_concat, compact_task_to_string};
+use risingwave_hummock_sdk::{LocalSstableInfo, can_concat, compact_task_to_string};
 use risingwave_pb::hummock::PbSstableFilterLayout;
 
 use crate::compaction_catalog_manager::CompactionCatalogAgentRef;
@@ -56,69 +56,9 @@ use crate::hummock::{
 };
 use crate::monitor::{CompactorMetrics, StoreLocalStatistic};
 
-/// V2-only capability object for the fast raw-copy path.
-///
-/// Fast compaction copies physical block bytes and per-block filter bytes. Keep
-/// those physical layout dependencies behind this planner instead of exposing
-/// them through the normal logical metadata accessor.
-struct RawCopyPlanner<'a> {
-    sstable: &'a TableHolder,
-}
+mod raw_copy;
 
-impl<'a> RawCopyPlanner<'a> {
-    fn for_current_v2(sstable: &'a TableHolder) -> Self {
-        Self { sstable }
-    }
-
-    fn block_count(&self) -> usize {
-        self.sstable.meta.block_metas.len()
-    }
-
-    fn block_metas_from(&self, block_idx: usize) -> &'a [BlockMeta] {
-        &self.sstable.meta.block_metas[block_idx..]
-    }
-
-    fn raw_block_meta(&self, block_idx: usize) -> BlockMeta {
-        self.sstable.meta.block_metas[block_idx].clone()
-    }
-
-    fn raw_block_filter(&self, block_idx: usize) -> Vec<u8> {
-        self.sstable.filter_reader.get_block_raw_filter(block_idx)
-    }
-
-    fn block_smallest_key(&self, block_idx: usize) -> &'a [u8] {
-        self.sstable.meta.block_metas[block_idx]
-            .smallest_key
-            .as_ref()
-    }
-
-    fn block_largest_key(&self, block_idx: usize) -> &'a [u8] {
-        if block_idx + 1 < self.block_count() {
-            self.block_smallest_key(block_idx + 1)
-        } else {
-            self.sstable_largest_key()
-        }
-    }
-
-    fn raw_block_exclusive_largest_key(&self, next_block_idx: usize) -> Vec<u8> {
-        if next_block_idx < self.block_count() {
-            let mut largest_key = FullKey::decode(self.block_smallest_key(next_block_idx));
-            // Do not include this key because it is the smallest key of next block.
-            largest_key.epoch_with_gap = EpochWithGap::new_max_epoch();
-            largest_key.encode()
-        } else {
-            self.sstable.meta.largest_key.clone()
-        }
-    }
-
-    fn sstable_largest_key(&self) -> &'a [u8] {
-        self.sstable.meta.largest_key.as_ref()
-    }
-
-    fn sstable_largest_key_vec(&self) -> Vec<u8> {
-        self.sstable.meta.largest_key.clone()
-    }
-}
+use self::raw_copy::{RawCopyCapability, RawCopyPlanner};
 
 /// Iterates over the KV-pairs of an SST while downloading it.
 pub struct BlockStreamIterator {
@@ -177,6 +117,15 @@ impl BlockStreamIterator {
         }
     }
 
+    fn raw_copy(&self) -> RawCopyPlanner<'_> {
+        match RawCopyCapability::try_new_current(&self.sstable) {
+            RawCopyCapability::Supported(planner) => planner,
+            RawCopyCapability::Unsupported => {
+                unreachable!("current fast raw-copy path only accepts supported V2 SSTables")
+            }
+        }
+    }
+
     async fn create_stream(&mut self) -> HummockResult<()> {
         // Fast compaction streams the physical SST blocks directly. Table-id pruning is handled
         // later by `CompactTaskExecutor` before raw block copy or decoded block compaction.
@@ -184,8 +133,7 @@ impl BlockStreamIterator {
             .sstable_store
             .get_stream_for_blocks(
                 self.sstable_info.object_id,
-                RawCopyPlanner::for_current_v2(&self.sstable)
-                    .block_metas_from(self.next_block_index),
+                self.raw_copy().block_metas_from(self.next_block_index),
             )
             .instrument_await("stream_iter_get_stream".verbose())
             .await?;
@@ -212,7 +160,7 @@ impl BlockStreamIterator {
             };
             match ret {
                 Ok(Some((data, _))) => {
-                    let raw_copy_planner = RawCopyPlanner::for_current_v2(&self.sstable);
+                    let raw_copy_planner = self.raw_copy();
                     let meta = raw_copy_planner.raw_block_meta(self.next_block_index);
                     let filter_block = raw_copy_planner.raw_block_filter(self.next_block_index);
                     self.next_block_index += 1;
@@ -245,7 +193,7 @@ impl BlockStreamIterator {
             }
         }
 
-        self.next_block_index = RawCopyPlanner::for_current_v2(&self.sstable).block_count();
+        self.next_block_index = self.raw_copy().block_count();
         self.iter.take();
         Ok(None)
     }
@@ -263,20 +211,20 @@ impl BlockStreamIterator {
     }
 
     fn next_block_smallest(&self) -> &[u8] {
-        RawCopyPlanner::for_current_v2(&self.sstable).block_smallest_key(self.next_block_index)
+        self.raw_copy().block_smallest_key(self.next_block_index)
     }
 
     fn next_block_largest(&self) -> &[u8] {
-        RawCopyPlanner::for_current_v2(&self.sstable).block_largest_key(self.next_block_index)
+        self.raw_copy().block_largest_key(self.next_block_index)
     }
 
     fn current_block_largest(&self) -> Vec<u8> {
-        RawCopyPlanner::for_current_v2(&self.sstable)
+        self.raw_copy()
             .raw_block_exclusive_largest_key(self.next_block_index)
     }
 
     fn sstable_largest_key_vec(&self) -> Vec<u8> {
-        RawCopyPlanner::for_current_v2(&self.sstable).sstable_largest_key_vec()
+        self.raw_copy().sstable_largest_key_vec()
     }
 
     fn key(&self) -> FullKey<&[u8]> {
@@ -287,8 +235,7 @@ impl BlockStreamIterator {
     }
 
     pub(crate) fn is_valid(&self) -> bool {
-        self.iter.is_some()
-            || self.next_block_index < RawCopyPlanner::for_current_v2(&self.sstable).block_count()
+        self.iter.is_some() || self.next_block_index < self.raw_copy().block_count()
     }
 
     #[cfg(test)]
