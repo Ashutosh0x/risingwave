@@ -27,12 +27,15 @@ use risingwave_hummock_sdk::key::FullKey;
 use risingwave_hummock_sdk::key_range::KeyRange;
 use risingwave_hummock_sdk::sstable_info::SstableInfo;
 
+#[cfg(test)]
+use crate::hummock::BlockMeta;
 use crate::hummock::block_stream::BlockDataStream;
 use crate::hummock::compactor::task_progress::TaskProgress;
 use crate::hummock::iterator::{Forward, HummockIterator, ValueMeta};
+use crate::hummock::sstable::SstableMetaHandle;
 use crate::hummock::sstable_store::SstableStoreRef;
 use crate::hummock::value::HummockValue;
-use crate::hummock::{BlockHolder, BlockIterator, BlockMeta, HummockResult, TableHolder};
+use crate::hummock::{BlockHolder, BlockIterator, HummockResult, TableHolder};
 use crate::monitor::StoreLocalStatistic;
 
 const PROGRESS_KEY_INTERVAL: usize = 100;
@@ -99,14 +102,13 @@ impl SstableStreamIterator {
         let read_table_ids = HashSet::from_iter(sstable_info.table_ids.iter().copied());
         // Further filter the block_metas_range with sstable_info.key_range
         // This is necessary when the SST is split into multiple SstableInfo with different key ranges
-        let block_metas_range = {
-            let block_metas = &sstable.meta.block_metas[block_metas_range.clone()];
-            let inner_range =
-                filter_block_metas(block_metas, &read_table_ids, sstable_info.key_range.clone());
-            // Adjust the range to be relative to the original block_metas
-            (block_metas_range.start + inner_range.start)
-                ..(block_metas_range.start + inner_range.end)
-        };
+        let meta_handle = SstableMetaHandle::v2(&sstable);
+        let block_metas_range = filter_block_metas_with_handle(
+            &meta_handle,
+            block_metas_range,
+            &read_table_ids,
+            sstable_info.key_range.clone(),
+        );
 
         let key_range_left = FullKey::decode(&sstable_info.key_range.left).to_vec();
         let key_range_right = FullKey::decode(&sstable_info.key_range.right).to_vec();
@@ -131,12 +133,6 @@ impl SstableStreamIterator {
         }
     }
 
-    /// Returns the block metas slice for this iterator.
-    #[inline]
-    fn block_metas(&self) -> &[BlockMeta] {
-        &self.sstable.meta.block_metas[self.block_metas_range.clone()]
-    }
-
     /// Returns the number of blocks in this iterator.
     #[inline]
     fn block_count(&self) -> usize {
@@ -144,12 +140,12 @@ impl SstableStreamIterator {
     }
 
     async fn create_stream(&mut self) -> HummockResult<()> {
+        let block_metas = SstableMetaHandle::v2(&self.sstable).block_metas_vec(
+            self.block_metas_range.start + self.block_idx..self.block_metas_range.end,
+        );
         let block_stream = self
             .sstable_store
-            .get_stream_for_blocks(
-                self.sstable_info.object_id,
-                &self.block_metas()[self.block_idx..],
-            )
+            .get_stream_for_block_metas(self.sstable_info.object_id, block_metas)
             .instrument_await("stream_iter_get_stream".verbose())
             .await?;
         self.block_stream = Some(block_stream);
@@ -465,8 +461,13 @@ impl ConcatSstableIterator {
                 None => self.key_range.clone(),
             };
 
-            let block_metas_range =
-                filter_block_metas(&sstable.meta.block_metas, &read_table_ids, filter_key_range);
+            let meta_handle = SstableMetaHandle::v2(&sstable);
+            let block_metas_range = filter_block_metas_with_handle(
+                &meta_handle,
+                0..meta_handle.block_count(),
+                &read_table_ids,
+                filter_key_range,
+            );
 
             let mut found = true;
             if block_metas_range.is_empty() {
@@ -642,6 +643,7 @@ impl<I: HummockIterator<Direction = Forward>> HummockIterator for MonitoredCompa
     }
 }
 
+#[cfg(test)]
 pub(crate) fn filter_block_metas(
     block_metas: &[BlockMeta],
     read_table_ids: &HashSet<TableId>,
@@ -727,6 +729,93 @@ pub(crate) fn filter_block_metas(
     start_index..(end_index + 1)
 }
 
+fn filter_block_metas_with_handle(
+    meta_handle: &SstableMetaHandle<'_>,
+    block_metas_range: Range<usize>,
+    read_table_ids: &HashSet<TableId>,
+    key_range: KeyRange,
+) -> Range<usize> {
+    if block_metas_range.is_empty() {
+        return block_metas_range.start..block_metas_range.start;
+    }
+
+    let global_range = block_metas_range.start..=block_metas_range.end - 1;
+    let mut start_index = if key_range.left.is_empty() {
+        block_metas_range.start
+    } else {
+        // start_index points to the greatest block whose smallest_key <= seek_key.
+        meta_handle
+            .block_metas_partition_point(global_range.clone(), |block| {
+                KeyComparator::compare_encoded_full_key(&key_range.left, &block.smallest_key)
+                    != Ordering::Less
+            })
+            .saturating_sub(1)
+            .max(block_metas_range.start)
+    };
+
+    let mut end_index = if key_range.right.is_empty() {
+        block_metas_range.end
+    } else {
+        let ret = meta_handle.block_metas_partition_point(global_range, |block| {
+            KeyComparator::compare_encoded_full_key(&block.smallest_key, &key_range.right)
+                != Ordering::Greater
+        });
+
+        if ret == block_metas_range.start {
+            // not found
+            return block_metas_range.start..block_metas_range.start;
+        }
+
+        ret
+    }
+    .saturating_sub(1);
+
+    // Skip blocks that are not in the SST read table ids.
+    while start_index <= end_index {
+        let start_block_table_id = meta_handle.block_meta(start_index).table_id();
+        if read_table_ids.contains(&start_block_table_id) {
+            break;
+        }
+
+        // skip this table_id
+        let old_start_index = start_index;
+        start_index = meta_handle
+            .block_metas_partition_point(start_index..=end_index, |block_meta| {
+                block_meta.table_id() == start_block_table_id
+            });
+
+        if old_start_index == start_index {
+            // no more blocks with the same table_id
+            break;
+        }
+    }
+
+    while start_index <= end_index {
+        let end_block_table_id = meta_handle.block_meta(end_index).table_id();
+        if read_table_ids.contains(&end_block_table_id) {
+            break;
+        }
+
+        let old_end_index = end_index;
+        end_index = meta_handle
+            .block_metas_partition_point(start_index..=end_index, |block_meta| {
+                block_meta.table_id() < end_block_table_id
+            })
+            .saturating_sub(1);
+
+        if end_index == old_end_index {
+            // no more blocks with the same table_id
+            break;
+        }
+    }
+
+    if start_index > end_index {
+        return block_metas_range.start..block_metas_range.start;
+    }
+
+    start_index..(end_index + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
@@ -738,15 +827,16 @@ mod tests {
     use risingwave_hummock_sdk::key_range::KeyRange;
     use risingwave_hummock_sdk::sstable_info::{SstableInfo, SstableInfoInner};
 
-    use crate::hummock::BlockMeta;
     use crate::hummock::compactor::ConcatSstableIterator;
     use crate::hummock::iterator::test_utils::mock_sstable_store;
     use crate::hummock::iterator::{HummockIterator, MergeIterator};
+    use crate::hummock::sstable::SstableMetaHandle;
     use crate::hummock::test_utils::{
         TEST_KEYS_COUNT, default_builder_opt_for_test, gen_test_sstable_info,
         gen_test_sstable_with_table_ids, test_key_of, test_value_of,
     };
     use crate::hummock::value::HummockValue;
+    use crate::hummock::{BlockMeta, Sstable, SstableMeta};
 
     #[tokio::test]
     async fn test_concat_iterator() {
@@ -1219,6 +1309,104 @@ mod tests {
                     .as_raw_id()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_filter_block_metas_with_handle_matches_slice_helper() {
+        fn check_equivalent(
+            block_metas: Vec<BlockMeta>,
+            read_table_ids: HashSet<TableId>,
+            key_range: KeyRange,
+        ) {
+            let expected =
+                super::filter_block_metas(&block_metas, &read_table_ids, key_range.clone());
+            let sstable = Sstable::new(
+                0.into(),
+                SstableMeta {
+                    block_metas,
+                    ..Default::default()
+                },
+                false,
+            );
+            let actual = super::filter_block_metas_with_handle(
+                &SstableMetaHandle::v2(&sstable),
+                0..sstable.block_count(),
+                &read_table_ids,
+                key_range,
+            );
+
+            assert_eq!(expected, actual);
+        }
+
+        let block_metas = vec![
+            BlockMeta {
+                smallest_key: FullKey::for_test(TableId::new(1), b"a".to_vec(), 0).encode(),
+                ..Default::default()
+            },
+            BlockMeta {
+                smallest_key: FullKey::for_test(TableId::new(1), b"c".to_vec(), 0).encode(),
+                ..Default::default()
+            },
+            BlockMeta {
+                smallest_key: FullKey::for_test(TableId::new(2), b"e".to_vec(), 0).encode(),
+                ..Default::default()
+            },
+            BlockMeta {
+                smallest_key: FullKey::for_test(TableId::new(3), b"g".to_vec(), 0).encode(),
+                ..Default::default()
+            },
+            BlockMeta {
+                smallest_key: FullKey::for_test(TableId::new(3), b"i".to_vec(), 0).encode(),
+                ..Default::default()
+            },
+        ];
+
+        let all_table_ids = HashSet::from_iter(vec![1_u32.into(), 2.into(), 3.into()]);
+        let table_id_2 = HashSet::from_iter(vec![2_u32.into()]);
+        let table_ids_2_3 = HashSet::from_iter(vec![2_u32.into(), 3.into()]);
+
+        check_equivalent(
+            block_metas.clone(),
+            all_table_ids.clone(),
+            KeyRange::default(),
+        );
+        check_equivalent(block_metas.clone(), table_id_2.clone(), KeyRange::default());
+        check_equivalent(
+            block_metas.clone(),
+            table_ids_2_3.clone(),
+            KeyRange::new(
+                FullKey::for_test(TableId::new(2), b"d".to_vec(), 0)
+                    .encode()
+                    .into(),
+                FullKey::for_test(TableId::new(3), b"h".to_vec(), 0)
+                    .encode()
+                    .into(),
+            ),
+        );
+        check_equivalent(
+            block_metas.clone(),
+            all_table_ids.clone(),
+            KeyRange::new(
+                FullKey::for_test(TableId::new(1), b"b".to_vec(), 0)
+                    .encode()
+                    .into(),
+                FullKey::for_test(TableId::new(1), b"b".to_vec(), 0)
+                    .encode()
+                    .into(),
+            ),
+        );
+        check_equivalent(
+            block_metas,
+            all_table_ids,
+            KeyRange::new(
+                FullKey::for_test(TableId::new(0), b"z".to_vec(), 0)
+                    .encode()
+                    .into(),
+                FullKey::for_test(TableId::new(0), b"z".to_vec(), 0)
+                    .encode()
+                    .into(),
+            ),
+        );
     }
 
     #[tokio::test]

@@ -48,7 +48,7 @@ use crate::hummock::iterator::{
 use crate::hummock::multi_builder::TableBuilderFactory;
 use crate::hummock::{
     CachePolicy, FilterBuilder, GetObjectId, HummockResult, MemoryLimiter, SstableBuilder,
-    SstableBuilderOptions, SstableWriterFactory, SstableWriterOptions,
+    SstableBuilderOptions, SstableMetaHandle, SstableWriterFactory, SstableWriterOptions,
 };
 use crate::monitor::StoreLocalStatistic;
 
@@ -258,7 +258,9 @@ pub async fn generate_splits(
                 .sstable_store
                 .sstable(sstable_info, &mut StoreLocalStatistic::default())
                 .await?;
-            indexes.extend(sstable.meta.block_metas.iter().map(|block| {
+            let meta_handle = SstableMetaHandle::v2(&sstable);
+            indexes.extend((0..meta_handle.block_count()).map(|block_idx| {
+                let block = meta_handle.block_meta(block_idx);
                 let data_size = block.len;
                 let full_key = FullKey {
                     user_key: FullKey::decode(&block.smallest_key).user_key,

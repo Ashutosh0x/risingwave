@@ -37,6 +37,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::hummock::local_version::pinned_version::PinnedVersion;
+use crate::hummock::sstable::SstableMetaHandle;
 use crate::hummock::{
     Block, HummockError, HummockResult, RecentFilterTrait, Sstable, SstableBlockIndex,
     SstableStoreRef, TableHolder,
@@ -444,13 +445,14 @@ impl CacheRefillTask {
         }
 
         for psst in parent_ssts {
+            let meta_handle = SstableMetaHandle::v2(&psst);
             for pblk in 0..psst.block_count() {
-                let pleft = &psst.meta.block_metas[pblk].smallest_key;
+                let pleft = &meta_handle.block_meta(pblk).smallest_key;
                 let pright = if pblk + 1 == psst.block_count() {
                     // `largest_key` can be included or excluded, both are treated as included here
                     &psst.meta.largest_key
                 } else {
-                    &psst.meta.block_metas[pblk + 1].smallest_key
+                    &meta_handle.block_meta(pblk + 1).smallest_key
                 };
 
                 // partition point: unit.right < pblk.left
@@ -630,13 +632,14 @@ impl CacheRefillTask {
         recent_filter.insert((sst.id, usize::MAX));
 
         let blocks = unit.blks.size().unwrap();
+        let meta_handle = SstableMetaHandle::v2(sst);
 
         let mut tasks = vec![];
         let mut contexts = Vec::with_capacity(blocks);
         let mut admits = 0;
 
-        let (range_first, _) = sst.calculate_block_info(unit.blks.start);
-        let (range_last, _) = sst.calculate_block_info(unit.blks.end - 1);
+        let (range_first, _) = meta_handle.block_range(unit.blks.start);
+        let (range_last, _) = meta_handle.block_range(unit.blks.end - 1);
         let range = range_first.start..range_last.end;
 
         let size = range.size().unwrap();
@@ -646,7 +649,7 @@ impl CacheRefillTask {
             .inc_by(size as _);
 
         for blk in unit.blks {
-            let (range, uncompressed_capacity) = sst.calculate_block_info(blk);
+            let (range, uncompressed_capacity) = meta_handle.block_range(blk);
             let key = SstableBlockIndex {
                 sst_id: sst.id,
                 block_idx: blk as u64,
@@ -760,7 +763,9 @@ impl<'a> Unit<'a> {
     }
 
     fn smallest_key(&self) -> &Vec<u8> {
-        &self.sst.meta.block_metas[self.blks.start].smallest_key
+        &SstableMetaHandle::v2(self.sst)
+            .block_meta(self.blks.start)
+            .smallest_key
     }
 
     // `largest_key` can be included or excluded, both are treated as included here
@@ -768,7 +773,9 @@ impl<'a> Unit<'a> {
         if self.blks.end == self.sst.block_count() {
             &self.sst.meta.largest_key
         } else {
-            &self.sst.meta.block_metas[self.blks.end].smallest_key
+            &SstableMetaHandle::v2(self.sst)
+                .block_meta(self.blks.end)
+                .smallest_key
         }
     }
 
