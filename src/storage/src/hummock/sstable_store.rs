@@ -28,6 +28,7 @@ use foyer::{
 };
 use futures::{FutureExt, StreamExt, future};
 use prost::Message;
+use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_hummock_sdk::vector_index::{HnswGraphFileInfo, VectorFileInfo};
 use risingwave_hummock_sdk::{
@@ -434,7 +435,9 @@ impl SstableStore {
         };
         let mut offset = 0;
         let mut blocks = VecDeque::default();
-        for (idx, block_meta) in (block_index..end_index).zip(block_meta_window.metas.iter()) {
+        for (idx, block_meta) in
+            (block_index..end_index).zip_eq_fast(block_meta_window.metas.iter())
+        {
             let end = offset + block_meta.len as usize;
             if end > buf.len() {
                 return Err(ObjectError::internal("read unexpected EOF").into());

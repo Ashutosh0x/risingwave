@@ -1370,10 +1370,10 @@ mod tests {
             all_table_ids.clone(),
             KeyRange::default(),
         );
-        check_equivalent(block_metas.clone(), table_id_2.clone(), KeyRange::default());
+        check_equivalent(block_metas.clone(), table_id_2, KeyRange::default());
         check_equivalent(
             block_metas.clone(),
-            table_ids_2_3.clone(),
+            table_ids_2_3,
             KeyRange::new(
                 FullKey::for_test(TableId::new(2), b"d".to_vec(), 0)
                     .encode()
