@@ -58,7 +58,7 @@ use crate::monitor::{CompactorMetrics, StoreLocalStatistic};
 
 mod raw_copy;
 
-use self::raw_copy::{RawCopyCapability, RawCopyPlanner};
+use self::raw_copy::RawCopyPlanner;
 
 /// Iterates over the KV-pairs of an SST while downloading it.
 pub struct BlockStreamIterator {
@@ -118,12 +118,7 @@ impl BlockStreamIterator {
     }
 
     fn raw_copy(&self) -> RawCopyPlanner<'_> {
-        match RawCopyCapability::try_new_current(&self.sstable) {
-            RawCopyCapability::Supported(planner) => planner,
-            RawCopyCapability::Unsupported => {
-                unreachable!("current fast raw-copy path only accepts supported V2 SSTables")
-            }
-        }
+        RawCopyPlanner::for_current_v2(&self.sstable)
     }
 
     async fn create_stream(&mut self) -> HummockResult<()> {

@@ -17,22 +17,6 @@ use risingwave_hummock_sdk::key::FullKey;
 
 use crate::hummock::{BlockMeta, TableHolder};
 
-/// Capability result for fast raw-copy.
-///
-/// The runner should only branch on whether raw-copy is supported. Format and
-/// physical-layout details stay inside this module.
-pub(super) enum RawCopyCapability<'a> {
-    Supported(RawCopyPlanner<'a>),
-    #[expect(dead_code, reason = "reserved for future V3 raw-copy fallback")]
-    Unsupported,
-}
-
-impl<'a> RawCopyCapability<'a> {
-    pub(super) fn try_new_current(sstable: &'a TableHolder) -> Self {
-        Self::Supported(RawCopyPlanner { sstable })
-    }
-}
-
 /// V2-only planner for the current fast raw-copy path.
 ///
 /// Fast compaction copies physical block bytes and per-block filter bytes. Keep
@@ -43,6 +27,10 @@ pub(super) struct RawCopyPlanner<'a> {
 }
 
 impl<'a> RawCopyPlanner<'a> {
+    pub(super) fn for_current_v2(sstable: &'a TableHolder) -> Self {
+        Self { sstable }
+    }
+
     pub(super) fn block_count(&self) -> usize {
         self.sstable.meta.block_metas.len()
     }
