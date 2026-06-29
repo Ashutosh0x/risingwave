@@ -35,6 +35,7 @@ use risingwave_object_store::object::{ObjectMetadata, ObjectStoreImpl};
 use risingwave_pb::hummock::{PbSstableFilterLayout, PbSstableFilterType};
 use risingwave_pb::id::TableId;
 use risingwave_rpc_client::MetaClient;
+use risingwave_storage::hummock::sstable::SstableMetaHandle;
 use risingwave_storage::hummock::value::HummockValue;
 use risingwave_storage::hummock::{
     Block, BlockHolder, BlockIterator, CompressionAlgorithm, Sstable, SstableStore,
@@ -301,13 +302,14 @@ async fn print_block(
     println!("\tBlock {}", block_idx);
     println!("\t-----------");
 
-    let block_meta = &sst.meta.block_metas[block_idx];
+    let meta_handle = SstableMetaHandle::v2(sst);
+    let block_meta = meta_handle.block_meta(block_idx);
     let smallest_key = FullKey::decode(&block_meta.smallest_key);
     let data_path = sstable_store.get_sst_data_path(sst.id);
 
     // Retrieve encoded block data in bytes
     let store = sstable_store.store();
-    let range = block_meta.offset as usize..block_meta.offset as usize + block_meta.len as usize;
+    let (range, _) = meta_handle.block_range(block_idx);
     let block_data = store.read(&data_path, range).await?;
 
     // Retrieve checksum and compression algorithm used from the encoded block data
