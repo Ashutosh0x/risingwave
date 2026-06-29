@@ -19,7 +19,8 @@ mod block;
 
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
-use std::ops::{BitXor, Bound, Range};
+use std::ops::{BitXor, Bound, Range, RangeInclusive};
+use std::sync::Arc;
 
 pub use block::*;
 mod block_iterator;
@@ -225,6 +226,134 @@ impl Sstable {
         std::mem::size_of::<Self>()
             + self.meta.estimated_heap_size()
             + self.filter_reader.estimated_heap_size()
+    }
+}
+
+/// SST metadata format selected by the per-SST metadata handle.
+///
+/// Phase 1 is intentionally V2-only: it introduces the capability boundary
+/// without adding V3 decoding or changing the underlying metadata layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SstableMetaFormat {
+    V2,
+}
+
+/// Identifies where a [`BlockMetaWindow`] was loaded from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetaWindowSource {
+    V2FullMeta,
+}
+
+/// A contiguous window of block metadata using global block indexes.
+///
+/// `start_block_idx` is the global block index of `metas[0]`, so block cache
+/// keys remain `(object_id, global_block_idx)`. Accessors must preserve the
+/// current lower-bound semantics: a window for a key/range may start before the
+/// first block whose smallest key is greater than or equal to the lower bound.
+#[derive(Clone, Debug)]
+pub struct BlockMetaWindow {
+    pub object_id: HummockSstableObjectId,
+    pub start_block_idx: usize,
+    pub metas: Arc<[BlockMeta]>,
+    pub source: MetaWindowSource,
+}
+
+impl BlockMetaWindow {
+    pub fn end_block_idx(&self) -> usize {
+        self.start_block_idx + self.metas.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.metas.is_empty()
+    }
+}
+
+/// Per-SST metadata capability handle.
+///
+/// This is not a public wrapper around full [`SstableMeta`]. Callers should ask
+/// for operations such as filter matching, single-block metadata, or metadata
+/// windows. The V2 implementation still uses the existing full meta internally.
+#[derive(Clone, Copy, Debug)]
+pub enum SstableMetaHandle<'a> {
+    V2(&'a Sstable),
+}
+
+impl<'a> SstableMetaHandle<'a> {
+    pub fn v2(sst: &'a Sstable) -> Self {
+        Self::V2(sst)
+    }
+
+    pub fn format(&self) -> SstableMetaFormat {
+        match self {
+            Self::V2(_) => SstableMetaFormat::V2,
+        }
+    }
+
+    pub fn object_id(&self) -> HummockSstableObjectId {
+        match self {
+            Self::V2(sst) => sst.id,
+        }
+    }
+
+    pub fn block_count(&self) -> usize {
+        match self {
+            Self::V2(sst) => sst.block_count(),
+        }
+    }
+
+    pub fn block_meta(&self, global_block_idx: usize) -> &'a BlockMeta {
+        match self {
+            Self::V2(sst) => &sst.meta.block_metas[global_block_idx],
+        }
+    }
+
+    pub fn block_metas_partition_point(
+        &self,
+        range: RangeInclusive<usize>,
+        pred: impl FnMut(&BlockMeta) -> bool,
+    ) -> usize {
+        let start = *range.start();
+        let end = *range.end();
+        match self {
+            Self::V2(sst) => start + sst.meta.block_metas[start..=end].partition_point(pred),
+        }
+    }
+
+    pub fn block_metas_vec(&self, range: Range<usize>) -> Vec<BlockMeta> {
+        match self {
+            Self::V2(sst) => sst.meta.block_metas[range].to_vec(),
+        }
+    }
+
+    pub fn block_range(&self, global_block_idx: usize) -> (Range<usize>, usize) {
+        let block_meta = self.block_meta(global_block_idx);
+        let range =
+            block_meta.offset as usize..block_meta.offset as usize + block_meta.len as usize;
+        let uncompressed_capacity = block_meta.uncompressed_size as usize;
+        (range, uncompressed_capacity)
+    }
+
+    pub fn block_meta_window(
+        &self,
+        start_block_idx: usize,
+        end_block_idx: usize,
+    ) -> BlockMetaWindow {
+        let end_block_idx = std::cmp::min(end_block_idx, self.block_count());
+        match self {
+            Self::V2(sst) => BlockMetaWindow {
+                object_id: sst.id,
+                start_block_idx,
+                metas: Arc::from(&sst.meta.block_metas[start_block_idx..end_block_idx]),
+                source: MetaWindowSource::V2FullMeta,
+            },
+        }
+    }
+
+    #[inline(always)]
+    pub fn may_match_hash(&self, user_key_range: &UserKeyRangeRef<'_>, hash: u64) -> bool {
+        match self {
+            Self::V2(sst) => sst.may_match_hash(user_key_range, hash),
+        }
     }
 }
 
